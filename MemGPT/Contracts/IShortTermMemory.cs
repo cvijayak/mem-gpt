@@ -4,5 +4,6 @@
     {
         void Add(ChatMessage chatMessage);
         ChatMessage[] Get();
+        void Delete();
     }
 }

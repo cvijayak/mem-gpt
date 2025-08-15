@@ -2,39 +2,33 @@
 {
     using System;
     using System.Collections.Generic;
+    using System.Linq;
+    using System.Threading;
     using System.Threading.Tasks;
     using Contracts;
     using Microsoft.Extensions.VectorData;
     using Microsoft.SemanticKernel.Connectors.Qdrant;
     using Qdrant.Client;
 
-    public class LongTermMemory : ILongTermMemory
+    public class LongTermMemory(string userId, string collectionName, int capacity, QdrantClient qdrantClient, IEmbeddingService embeddingService) : ILongTermMemory
     {
-        private readonly VectorStoreCollection<Guid, ChatMessage> _collection;
-        private readonly VectorStore _vectorStore;
-        private readonly string _userId;
-        private readonly int _capacity;
-        private readonly IEmbeddingService _embeddingService;
-
-        public LongTermMemory(string userId, string collectionName, int capacity, QdrantClient qdrantClient, IEmbeddingService embeddingService)
+        public async Task AddAsync(ChatMessage chatMessage, CancellationToken cancellationToken)
         {
-            _userId = userId;
-            _capacity = capacity;
-            _embeddingService = embeddingService;
-            _vectorStore = new QdrantVectorStore(qdrantClient, ownsClient: false);
-            _collection = _vectorStore.GetCollection<Guid, ChatMessage>(collectionName);
+            using var vectorStore = new QdrantVectorStore(qdrantClient, ownsClient: false);
+            using var collection = vectorStore.GetCollection<Guid, ChatMessage>(collectionName);
+            await collection.UpsertAsync(chatMessage, cancellationToken);
         }
 
-        public async Task AddAsync(ChatMessage chatMessage) => await _collection.UpsertAsync(chatMessage);
-        public async Task AddAsync(ChatMessage[] chatMessages) => await _collection.UpsertAsync(chatMessages);
-        public async Task<ChatMessage[]> SearchAsync(string text)
+        public async Task<ChatMessage[]> SearchAsync(string text, CancellationToken cancellationToken)
         {
-            var queryVector = await _embeddingService.GenerateEmbeddingAsync(text);
-            var searchResults = _collection.SearchAsync(queryVector, _capacity, new VectorSearchOptions<ChatMessage>
+            using var vectorStore = new QdrantVectorStore(qdrantClient, ownsClient: false);
+            using var collection = vectorStore.GetCollection<Guid, ChatMessage>(collectionName);
+            var queryVector = await embeddingService.GenerateEmbeddingAsync(text, cancellationToken);
+            var searchResults = collection.SearchAsync(queryVector, capacity, new VectorSearchOptions<ChatMessage>
             {
                 IncludeVectors = false,
-                Filter = f => f.UserId == _userId
-            });
+                Filter = f => f.UserId == userId
+            }, cancellationToken);
 
             var hotels = new List<ChatMessage>();
             await foreach (var searchResult in searchResults)
@@ -46,6 +40,42 @@
             }
 
             return hotels.ToArray();
+        }
+        
+        public async Task DeleteAsync(CancellationToken cancellationToken)
+        {
+            const int batchSize = 500;
+            var toDelete = new List<Guid>(batchSize);
+            bool hasMore = true;
+
+            using var vectorStore = new QdrantVectorStore(qdrantClient, ownsClient: false);
+            using var collection = vectorStore.GetCollection<Guid, ChatMessage>(collectionName);
+
+            while (hasMore)
+            {
+                var messages = collection.GetAsync(f => f.UserId == userId, top: batchSize, options: new FilteredRecordRetrievalOptions<ChatMessage>
+                {
+                    IncludeVectors = false,
+                }, cancellationToken: cancellationToken);
+
+                toDelete.Clear();
+                await foreach (var message in messages)
+                {
+                    toDelete.Add(message.Id);
+                }
+
+                if (toDelete.Count > 0)
+                {
+                    var uniqueIds = toDelete.Distinct().ToList();
+                    await collection.DeleteAsync(uniqueIds, cancellationToken);
+                }
+                else
+                {
+                    hasMore = false;
+                }
+
+                await Task.Delay(100, cancellationToken);
+            }
         }
     }
 }

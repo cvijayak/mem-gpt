@@ -129,6 +129,8 @@ builder.Services.AddSingleton<Func<string, Kernel>>(sp =>
 });
 builder.Services.AddTransient<IMemoryManager, MemoryManager>();
 builder.Services.AddTransient<IPromptBuilder, PromptBuilder>();
+builder.Services.AddSingleton<IMemoryDeletionWorker, MemoryDeletionWorker>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<IMemoryDeletionWorker>() as MemoryDeletionWorker);
 
 builder.Services.AddControllers();
 var app = builder.Build();

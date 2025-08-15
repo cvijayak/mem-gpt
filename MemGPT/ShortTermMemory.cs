@@ -24,5 +24,7 @@
         }
 
         public ChatMessage[] Get() => _chatMessages.ToArray();
+
+        public void Delete() => _chatMessages.Clear();
     }
 }
