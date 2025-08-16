@@ -6,11 +6,11 @@
     using System.Threading.Tasks;
     using Contracts;
     using Contracts.Requests;
+    using MemGPT.Contracts.Services;
     using Microsoft.AspNetCore.Http;
     using Microsoft.AspNetCore.Mvc;
     using Microsoft.SemanticKernel;
     using Microsoft.SemanticKernel.ChatCompletion;
-    using ChatMessage = Contracts.ChatMessage;
 
     [ApiController]
     [Route("api/chat")]
@@ -24,53 +24,80 @@
         }
 
         [HttpGet]
-        public async Task<IActionResult> GetMessages(string userId, CancellationToken cancellationToken)
+        public IActionResult GetMessages(string userId, CancellationToken cancellationToken)
         {
-            var messages = await memoryManager.GetAsync(userId, cancellationToken);
-            return Ok(messages);
+            return Ok(memoryManager.GetAsync(userId, cancellationToken));
         }
 
         [HttpPost]
         public async Task SendMessage([FromBody] UserChatMessageRequest message, CancellationToken cancellationToken)
         {
-            await memoryManager.AddAsync(new ChatMessage
+            try
             {
-                Id = Guid.NewGuid(),
-                UserId = message.UserId,
-                Role = RoleType.User.ToString(),
-                Message = message.Message,
-                Timestamp = DateTimeOffset.UtcNow,
-                Embedding = await embeddingService.GenerateEmbeddingAsync(message.Message, cancellationToken)
-            }, cancellationToken);
-
-            var promptWithContext = await promptBuilder.BuildPromptAsync(message, cancellationToken);
-
-            Console.WriteLine(promptWithContext);
-
-            var kernel = kernelFactory(message.UserId);
-            var sb = new StringBuilder();
-
-            var chatCompletionService = kernel.GetRequiredService<IChatCompletionService>();
-            await foreach (var messageChunk in chatCompletionService.GetStreamingChatMessageContentsAsync(promptWithContext, cancellationToken: cancellationToken))
-            {
-                var text = messageChunk.Content;
-                if (!string.IsNullOrEmpty(text))
+                await memoryManager.AddAsync(new ChatMessage
                 {
-                    sb.Append(text);
-                    await Response.WriteAsync(text, cancellationToken);
-                    await Response.Body.FlushAsync(cancellationToken);
+                    Id = Guid.NewGuid(),
+                    UserId = message.UserId,
+                    Role = RoleType.User.ToString(),
+                    Message = message.Message,
+                    Timestamp = DateTimeOffset.UtcNow,
+                    Embedding = await embeddingService.GenerateEmbeddingAsync(message.Message, cancellationToken)
+                }, cancellationToken);
+
+                var promptWithContext = await promptBuilder.BuildPromptAsync(message, cancellationToken);
+                Console.WriteLine(promptWithContext);
+
+                var kernel = kernelFactory(message.UserId);
+                var sb = new StringBuilder();
+
+                var chatCompletionService = kernel.GetRequiredService<IChatCompletionService>();
+                
+                try 
+                {
+                    await foreach (var messageChunk in chatCompletionService.GetStreamingChatMessageContentsAsync(promptWithContext, cancellationToken: cancellationToken))
+                    {
+                        if (cancellationToken.IsCancellationRequested)
+                        {
+                            break;
+                        }
+                        
+                        var text = messageChunk.Content;
+                        if (!string.IsNullOrEmpty(text))
+                        {
+                            sb.Append(text);
+                            await Response.WriteAsync(text, cancellationToken);
+                            await Response.Body.FlushAsync(cancellationToken);
+                        }
+                    }
+                    
+                    if (!cancellationToken.IsCancellationRequested)
+                    {
+                        await memoryManager.AddAsync(new ChatMessage
+                        {
+                            Id = Guid.NewGuid(),
+                            UserId = message.UserId,
+                            Role = RoleType.Assistant.ToString(),
+                            Message = sb.ToString(),
+                            Timestamp = DateTimeOffset.UtcNow,
+                            Embedding = await embeddingService.GenerateEmbeddingAsync(sb.ToString(), cancellationToken)
+                        }, cancellationToken);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    Console.WriteLine("Client disconnected during message streaming");
                 }
             }
-
-            await memoryManager.AddAsync(new ChatMessage
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                Id = Guid.NewGuid(),
-                UserId = message.UserId,
-                Role = RoleType.Assistant.ToString(),
-                Message = sb.ToString(),
-                Timestamp = DateTimeOffset.UtcNow,
-                Embedding = await embeddingService.GenerateEmbeddingAsync(message.Message, cancellationToken)
-            }, cancellationToken);
+                Console.WriteLine($"Error processing message: {ex.Message}");
+                
+                if (!cancellationToken.IsCancellationRequested && !Response.HasStarted)
+                {
+                    Response.StatusCode = 500;
+                    await Response.WriteAsync($"{{\"error\": \"Internal server error\"}}", CancellationToken.None);
+                }
+            }
         }
     }
 }

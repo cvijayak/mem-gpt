@@ -1,30 +1,24 @@
 # MemGPT
 
-MemGPT is a memory-augmented AI system designed to manage and retrieve information efficiently using both short-term and long-term memory modules. It leverages vector databases like Qdrant for embedding storage and retrieval, enabling advanced conversational and knowledge management capabilities.
+MemGPT is a memory-augmented AI system designed to manage and retrieve information efficiently using both short-term and long-term memory modules. It leverages Azure AI Search for vector embeddings storage and retrieval, enabling advanced conversational and knowledge management capabilities.
 
 ## What is MemGPT?
 MemGPT is a C#/.NET application that provides:
 - Short-term and long-term memory management for AI agents
-- Embedding service integration (e.g., with Qdrant)
+- Embedding service integration with Azure AI Search
 - Modular architecture for extensibility
 - REST API for chat/message operations
 
-## How to Run Qdrant
-Qdrant is an open-source vector database used for storing and searching embeddings. You can run Qdrant locally using Docker:
+## Azure AI Search Setup
+Azure AI Search is used for vector storage and retrieval. You'll need to set up an Azure AI Search service in your Azure account:
 
-```powershell
-# Pull the latest Qdrant image
-docker pull qdrant/qdrant
-
-# Run Qdrant container
-docker run -p 6333:6333 -p 6334:6334 qdrant/qdrant
-```
-
-Qdrant REST API will be available at `http://localhost:6333` and gRPC API at `http://localhost:6334`.
+1. Create an Azure AI Search service in the Azure Portal
+2. Get your search service endpoint and API key
+3. Update the configuration in `Program.cs` with your Azure AI Search details
 
 ## How to Run MemGPT
 1. Ensure .NET 9.0 SDK is installed.
-2. Start Qdrant (see above).
+2. Configure Azure AI Search endpoint and API key in `Program.cs`.
 3. Build and run the MemGPT project:
 
 ```powershell

@@ -1,114 +1,200 @@
-﻿namespace MemGPT
+namespace MemGPT
 {
     using System;
     using System.Collections.Generic;
     using System.Linq;
-    using System.Reflection;
+    using System.Runtime.CompilerServices;
     using System.Threading;
     using System.Threading.Tasks;
+    using Azure;
+    using Azure.Search.Documents;
+    using Azure.Search.Documents.Models;
+    using Config;
     using Contracts;
-    using Extensions;
-    using Microsoft.Extensions.VectorData;
-    using Microsoft.SemanticKernel.Connectors.Qdrant;
-    using Qdrant.Client;
-    using Qdrant.Client.Grpc;
+    using MemGPT.Contracts.Services;
+    using Microsoft.Extensions.Options;
 
-    public class LongTermMemory(string userId, string collectionName, int capacity, QdrantClient qdrantClient, IEmbeddingService embeddingService) : ILongTermMemory
+    public class LongTermMemory(string userId, SearchClient searchClient, IEmbeddingService embeddingService, IOptions<MemorySettingsOptions> settings) : ILongTermMemory
     {
+        private readonly MemorySettingsOptions _settings = settings.Value;
+
         public async Task AddAsync(ChatMessage chatMessage, CancellationToken cancellationToken)
         {
-            using var vectorStore = new QdrantVectorStore(qdrantClient, ownsClient: false);
-            using var collection = vectorStore.GetCollection<Guid, ChatMessage>(collectionName);
-            await collection.UpsertAsync(chatMessage, cancellationToken);
+            if (chatMessage.Embedding == null || chatMessage.Embedding.Length == 0)
+            {
+                chatMessage.Embedding = await embeddingService.GenerateEmbeddingAsync(chatMessage.Message, cancellationToken);
+            }
+
+            var searchableMessage = new SearchableChatMessage
+            {
+                Id = chatMessage.Id.ToString(),
+                UserId = chatMessage.UserId,
+                Role = chatMessage.Role,
+                Message = chatMessage.Message,
+                Timestamp = chatMessage.Timestamp,
+                Embedding = chatMessage.Embedding
+            };
+            
+            var batch = IndexDocumentsBatch.Upload([ searchableMessage ]);
+            await searchClient.IndexDocumentsAsync(batch, cancellationToken: cancellationToken);
         }
 
-        public async Task<ChatMessage[]> GetAsync(CancellationToken cancellationToken)
+        public async IAsyncEnumerable<ChatMessage> GetAsync([EnumeratorCancellation] CancellationToken cancellationToken)
         {
-            var chatMessages = new List<ChatMessage>();
-            PointId nextPageOffset = null;
-            uint pageSize = 500;
-            var fieldNames = typeof(ChatMessage)
-                .GetProperties(BindingFlags.Public | BindingFlags.Instance)
-                .Select(f =>
-                {
-                    var attr = f.GetCustomAttribute<VectorStoreDataAttribute>();
-                    return attr?.StorageName ?? f.Name;
-                })
-                .ToList();
-
-            var payloadSelector = new WithPayloadSelector { Include = new PayloadIncludeSelector() };
-            payloadSelector.Include.Fields.AddRange(fieldNames);
-
-            do
+            var options = new SearchOptions
             {
-                var response = await qdrantClient.ScrollAsync(collectionName: collectionName, 
-                    limit: pageSize, 
-                    offset: nextPageOffset,
-                    payloadSelector: payloadSelector,
-                    cancellationToken: cancellationToken);
-                var messages = response.Result.Select(d => MapFieldExtensions.MapToChatMessage(d.Payload)).ToArray();
-                chatMessages.AddRange(messages);
+                Filter = $"UserId eq '{userId}'",
+                IncludeTotalCount = true,
+                Size = _settings.LongTermMemory.PageSize
+            };
 
-                nextPageOffset = response.NextPageOffset;
-            } while (nextPageOffset != null);
+            options.OrderBy.Add("Timestamp");
 
-            return chatMessages.ToArray();
+            async Task<Response<SearchResults<SearchableChatMessage>>> GetSearchResponse(int skip)
+            {
+                try
+                {
+                    options.Skip = skip;
+                    return await searchClient.SearchAsync<SearchableChatMessage>("*", options, cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    Console.WriteLine("Query cancelled");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error retrieving messages: {ex.Message}");
+                }
+
+                return null;
+            }
+            
+            int currentSkip = 0;
+            bool hasMoreResults = true;
+            
+            while (hasMoreResults && !cancellationToken.IsCancellationRequested)
+            {
+                var response = await GetSearchResponse(currentSkip);
+                if (response == null)
+                {
+                    yield break;
+                }
+
+                var results = response.Value.GetResults().ToList();
+
+                var resultCount = results.Count;
+                foreach (var result in results)
+                {
+                    var doc = result.Document;
+                    yield return new ChatMessage
+                    {
+                        Id = Guid.Parse(doc.Id),
+                        UserId = doc.UserId,
+                        Role = doc.Role,
+                        Message = doc.Message,
+                        Timestamp = doc.Timestamp,
+                        Embedding = doc.Embedding
+                    };
+                }
+
+                if (resultCount > 0)
+                {
+                    currentSkip += resultCount;
+                    hasMoreResults = currentSkip < response.Value.TotalCount;
+                }
+                else
+                {
+                    hasMoreResults = false;
+                }
+            }
         }
 
         public async Task<ChatMessage[]> SearchAsync(string text, CancellationToken cancellationToken)
         {
-            using var vectorStore = new QdrantVectorStore(qdrantClient, ownsClient: false);
-            using var collection = vectorStore.GetCollection<Guid, ChatMessage>(collectionName);
-            var queryVector = await embeddingService.GenerateEmbeddingAsync(text, cancellationToken);
-            var searchResults = collection.SearchAsync(queryVector, capacity, new VectorSearchOptions<ChatMessage>
+            var queryEmbedding = await embeddingService.GenerateEmbeddingAsync(text, cancellationToken);
+            var vectorQuery = new VectorizedQuery(queryEmbedding)
             {
-                IncludeVectors = false,
-                Filter = f => f.UserId == userId
-            }, cancellationToken);
-
+                KNearestNeighborsCount = _settings.LongTermMemory.Capacity,
+                Fields = { "Embedding" }
+            };
+            var vectorSearchOptions = new VectorSearchOptions
+            {
+                Queries = { vectorQuery }
+            };
+            var options = new SearchOptions
+            {
+                Filter = $"UserId eq '{userId}'",
+                Size = _settings.LongTermMemory.Capacity,
+                VectorSearch = vectorSearchOptions
+            };
+            
             var chatMessages = new List<ChatMessage>();
-            await foreach (var searchResult in searchResults)
+            var response = await searchClient.SearchAsync<SearchableChatMessage>("*", options, cancellationToken: cancellationToken);
+                
+            foreach (var result in response.Value.GetResults())
             {
-                if (searchResult.Score >= 0.7)
+                if (result.Score >= _settings.LongTermMemory.SimilarityThreshold)
                 {
-                    chatMessages.Add(searchResult.Record);
+                    var doc = result.Document;
+                    var chatMessage = new ChatMessage
+                    {
+                        Id = Guid.Parse(doc.Id),
+                        UserId = doc.UserId,
+                        Role = doc.Role,
+                        Message = doc.Message,
+                        Timestamp = doc.Timestamp,
+                        Embedding = doc.Embedding
+                    };
+                    
+                    chatMessages.Add(chatMessage);
                 }
             }
-
+            
             return chatMessages.ToArray();
         }
         
         public async Task DeleteAsync(CancellationToken cancellationToken)
         {
-            int batchSize = 500;
-            var toDelete = new List<Guid>(batchSize);
+            int batchSize = _settings.LongTermMemory.DeleteBatchSize;
             bool hasMore = true;
-
-            using var vectorStore = new QdrantVectorStore(qdrantClient, ownsClient: false);
-            using var collection = vectorStore.GetCollection<Guid, ChatMessage>(collectionName);
-
-            while (hasMore)
+            int retryCount = 0;
+            
+            while (hasMore && retryCount < _settings.LongTermMemory.MaxDeleteRetries)
             {
-                var retrievalOptions = new FilteredRecordRetrievalOptions<ChatMessage> { IncludeVectors = false };
-                var messages = collection.GetAsync(f => f.UserId == userId, top: batchSize, options: retrievalOptions, cancellationToken: cancellationToken);
-
-                toDelete.Clear();
-                await foreach (var message in messages)
+                try
                 {
-                    toDelete.Add(message.Id);
-                }
+                    var options = new SearchOptions
+                    {
+                        Filter = $"UserId eq '{userId}'",
+                        Size = batchSize
+                    };
 
-                if (toDelete.Count > 0)
-                {
-                    var uniqueIds = toDelete.Distinct().ToList();
-                    await collection.DeleteAsync(uniqueIds, cancellationToken);
+                    var response = await searchClient.SearchAsync<SearchableChatMessage>("*", options, cancellationToken);
+                    var toDelete = new List<string>();
+                    
+                    foreach (var result in response.Value.GetResults())
+                    {
+                        toDelete.Add(result.Document.Id);
+                    }
+                    
+                    if (toDelete.Count > 0)
+                    {
+                        await searchClient.DeleteDocumentsAsync("id", toDelete, cancellationToken: cancellationToken);
+                        await Task.Delay(50, cancellationToken);
+                    }
+                    else
+                    {
+                        hasMore = false;
+                    }
+                    
+                    retryCount = 0;
                 }
-                else
+                catch (Exception ex) when (ex is not OperationCanceledException)
                 {
-                    hasMore = false;
+                    retryCount++;
+                    await Task.Delay(_settings.LongTermMemory.DeleteRetryDelayBaseMs * (1 << retryCount), cancellationToken);
+                    Console.WriteLine($"Delete retry {retryCount} after error: {ex.Message}");
                 }
-
-                await Task.Delay(100, cancellationToken);
             }
         }
     }

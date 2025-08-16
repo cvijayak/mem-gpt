@@ -1,4 +1,4 @@
-﻿namespace MemGPT.Contracts
+﻿namespace MemGPT.Contracts.Services
 {
     using System.Threading;
     using System.Threading.Tasks;

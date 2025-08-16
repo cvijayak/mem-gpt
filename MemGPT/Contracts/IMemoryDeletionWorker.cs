@@ -1,4 +1,4 @@
-﻿namespace MemGPT
+﻿namespace MemGPT.Contracts
 {
     public interface IMemoryDeletionWorker
     {

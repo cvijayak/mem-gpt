@@ -1,6 +1,7 @@
 ﻿namespace MemGPT
 {
     using System;
+    using System.Collections.Generic;
     using System.Threading;
     using System.Threading.Tasks;
     using Contracts;
@@ -13,9 +14,9 @@
             await ltmFactory(chatMessage.UserId).AddAsync(chatMessage, cancellationToken);
         }
 
-        public async Task<ChatMessage[]> GetAsync(string userId, CancellationToken cancellationToken)
+        public IAsyncEnumerable<ChatMessage> GetAsync(string userId, CancellationToken cancellationToken)
         {
-            return await ltmFactory(userId).GetAsync(cancellationToken);
+            return ltmFactory(userId).GetAsync(cancellationToken);
         }
 
         public async Task DeleteAsync(string userId, CancellationToken cancellationToken)

@@ -12,10 +12,16 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.SemanticKernel" Version="1.62.0" />
-    <PackageReference Include="Microsoft.SemanticKernel.Connectors.Qdrant" Version="1.62.0-preview" />
     <PackageReference Include="Microsoft.SemanticKernel.Plugins.Memory" Version="1.62.0-alpha" />
     <PackageReference Include="Microsoft.SemanticKernel.Connectors.AzureOpenAI" Version="1.62.0" />
-    <PackageReference Include="Qdrant.Client" Version="1.15.0" />
+    <PackageReference Include="Azure.Search.Documents" Version="11.5.1" />
+    <PackageReference Include="Microsoft.Bcl.AsyncInterfaces" Version="8.0.0" />
+    <PackageReference Include="System.Linq.Async" Version="6.0.1" />
   </ItemGroup>
+  
+  <!-- Suppress experimental API warnings -->
+  <PropertyGroup>
+    <NoWarn>$(NoWarn);SKEXP0001;SKEXP0010;SKEXP0020;SKEXP0030</NoWarn>
+  </PropertyGroup>
 
 </Project>

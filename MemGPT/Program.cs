@@ -1,34 +1,47 @@
 ﻿using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Net.Http;
+using Azure;
+using Azure.Search.Documents;
+using Azure.Search.Documents.Indexes;
 using MemGPT;
+using MemGPT.Config;
 using MemGPT.Contracts;
+using MemGPT.Contracts.Services;
+using MemGPT.Services;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.SemanticKernel;
-using Qdrant.Client;
-using Qdrant.Client.Grpc;
 
 var builder = WebApplication.CreateBuilder(args);
 
 
 // Configuration
+var configuration = builder.Configuration;
 
-var vectorSize = 1536ul;
-var collectionName = "chat-messages";
-var azureOpenAiEmbeddingDeploymentName = "text-embedding-ada-002";
-var azureOpenAiChatDeploymentName = "gpt-4.1-mini";
-var azureOpenAiApiKey = "<AZURE_OPEN_AI_API_KEY>";
-var azureOpenAiEndpoint = "<AZURE_OPEN_AI_ENDPOINT>";
-var qdrantDbHost = "localhost";
-var qdrantDbPort = 6334;
-var stmCapacity = 10;
-var ltmCapacity = 10;
+var azureOpenAISection = configuration.GetSection("MemGpt:Azure:OpenAI");
+var azureOpenAIOptions = azureOpenAISection.Get<AzureOpenAIOptions>();
+
+var azureOpenAiEndpoint = azureOpenAIOptions.Endpoint;
+var azureOpenAiApiKey = azureOpenAIOptions.ApiKey;
+var azureOpenAiEmbeddingDeploymentName = azureOpenAIOptions.EmbeddingDeploymentName;
+var azureOpenAiChatDeploymentName = azureOpenAIOptions.ChatDeploymentName;
+
+var azureSearchSection = configuration.GetSection("MemGpt:Azure:Search");
+var azureSearchOptions = azureSearchSection.Get<AzureSearchOptions>();
+
+var azureSearchEndpoint = azureSearchOptions.Endpoint;
+var azureSearchApiKey = azureSearchOptions.ApiKey;
+var collectionName = azureSearchOptions.CollectionName;
+
+var memorySettingsSection = configuration.GetSection("MemGpt:MemorySettings");
+builder.Services.Configure<MemorySettingsOptions>(memorySettingsSection);
 
 // Configuration
 
 
-#pragma warning disable SKEXP0010
 builder.Services
     .AddKernel()
     .AddAzureOpenAIChatCompletion(
@@ -42,8 +55,7 @@ builder.Services
             ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator
         })
     )
-    .AddAzureOpenAIEmbeddingGenerator
-    (
+    .AddAzureOpenAIEmbeddingGenerator(
         deploymentName: azureOpenAiEmbeddingDeploymentName,
         endpoint: azureOpenAiEndpoint,
         apiKey: azureOpenAiApiKey,
@@ -54,9 +66,19 @@ builder.Services
             ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator
         })
     );
-#pragma warning restore SKEXP0010
 
-builder.Services.AddSingleton(_ => new QdrantClient(qdrantDbHost, qdrantDbPort));
+builder.Services.AddSingleton(_ => new SearchIndexClient(
+    new Uri(azureSearchEndpoint),
+    new AzureKeyCredential(azureSearchApiKey),
+    new SearchClientOptions { Retry = { MaxRetries = 10, MaxDelay = TimeSpan.FromSeconds(5) } }
+));
+
+builder.Services.AddSingleton(sp => 
+{
+    var searchIndexClient = sp.GetRequiredService<SearchIndexClient>();
+    return searchIndexClient.GetSearchClient(collectionName);
+});
+
 builder.Services.AddTransient<IEmbeddingService, EmbeddingService>();
 builder.Services.AddSingleton<Func<string, IShortTermMemory>>(sp =>
 {
@@ -74,7 +96,7 @@ builder.Services.AddSingleton<Func<string, IShortTermMemory>>(sp =>
             return shortTermMemory;
         }
 
-        shortTermMemory = ActivatorUtilities.CreateInstance<ShortTermMemory>(sp, stmCapacity);
+        shortTermMemory = ActivatorUtilities.CreateInstance<ShortTermMemory>(sp);
 
         cache[userId] = shortTermMemory;
 
@@ -84,7 +106,7 @@ builder.Services.AddSingleton<Func<string, IShortTermMemory>>(sp =>
 builder.Services.AddSingleton<Func<string, ILongTermMemory>>(sp =>
 {
     var cache = new ConcurrentDictionary<string, ILongTermMemory>();
-
+    
     return userId =>
     {
         if (string.IsNullOrEmpty(userId))
@@ -96,8 +118,7 @@ builder.Services.AddSingleton<Func<string, ILongTermMemory>>(sp =>
         {
             return longTermMemory;
         }
-
-        longTermMemory = ActivatorUtilities.CreateInstance<LongTermMemory>(sp, userId, collectionName, ltmCapacity);
+        longTermMemory = ActivatorUtilities.CreateInstance<LongTermMemory>(sp, userId);
 
         cache[userId] = longTermMemory;
 
@@ -132,20 +153,21 @@ builder.Services.AddTransient<IPromptBuilder, PromptBuilder>();
 builder.Services.AddSingleton<IMemoryDeletionWorker, MemoryDeletionWorker>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<IMemoryDeletionWorker>() as MemoryDeletionWorker);
 
+builder.Services.AddTransient<IMigrator>(sp => new ChatMessageIndexMigrator(
+    sp.GetRequiredService<SearchIndexClient>(),
+    collectionName,
+    azureSearchEndpoint,
+    azureSearchApiKey
+));
+
 builder.Services.AddControllers();
 var app = builder.Build();
 app.MapControllers();
 
-var qdrantClient = app.Services.GetRequiredService<QdrantClient>();
-if (!await qdrantClient.CollectionExistsAsync(collectionName))
+var migrators = app.Services.GetRequiredService<IEnumerable<IMigrator>>();
+foreach (var migrator in migrators)
 {
-    var vectorParams = new VectorParams
-    {
-        Size = vectorSize,
-        Distance = Distance.Cosine
-    };
-
-    await qdrantClient.CreateCollectionAsync(collectionName, vectorParams);
+    await migrator.MigrateAsync();
 }
 
-app.Run();
+await app.RunAsync();

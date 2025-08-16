@@ -1,5 +1,6 @@
 ﻿namespace MemGPT.Contracts
 {
+    using System.Collections.Generic;
     using System.Threading;
     using System.Threading.Tasks;
 
@@ -8,6 +9,6 @@
         Task AddAsync(ChatMessage chatMessage, CancellationToken cancellationToken);
         Task<ChatMessage[]> SearchAsync(string text, CancellationToken cancellationToken);
         Task DeleteAsync(CancellationToken cancellationToken);
-        Task<ChatMessage[]> GetAsync(CancellationToken cancellationToken);
+        IAsyncEnumerable<ChatMessage> GetAsync(CancellationToken cancellationToken);
     }
 }

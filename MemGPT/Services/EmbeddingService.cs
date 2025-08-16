@@ -1,8 +1,8 @@
-﻿namespace MemGPT
+﻿namespace MemGPT.Services
 {
     using System.Threading;
     using System.Threading.Tasks;
-    using Contracts;
+    using MemGPT.Contracts.Services;
     using Microsoft.Extensions.AI;
 
     public class EmbeddingService(IEmbeddingGenerator<string, Embedding<float>> embeddingGenerator) : IEmbeddingService
