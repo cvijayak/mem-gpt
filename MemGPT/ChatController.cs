@@ -23,6 +23,13 @@
             return Accepted();
         }
 
+        [HttpGet]
+        public async Task<IActionResult> GetMessages(string userId, CancellationToken cancellationToken)
+        {
+            var messages = await memoryManager.GetAsync(userId, cancellationToken);
+            return Ok(messages);
+        }
+
         [HttpPost]
         public async Task SendMessage([FromBody] UserChatMessageRequest message, CancellationToken cancellationToken)
         {

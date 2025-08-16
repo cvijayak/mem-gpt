@@ -3,12 +3,15 @@
     using System;
     using System.Collections.Generic;
     using System.Linq;
+    using System.Reflection;
     using System.Threading;
     using System.Threading.Tasks;
     using Contracts;
+    using Extensions;
     using Microsoft.Extensions.VectorData;
     using Microsoft.SemanticKernel.Connectors.Qdrant;
     using Qdrant.Client;
+    using Qdrant.Client.Grpc;
 
     public class LongTermMemory(string userId, string collectionName, int capacity, QdrantClient qdrantClient, IEmbeddingService embeddingService) : ILongTermMemory
     {
@@ -17,6 +20,39 @@
             using var vectorStore = new QdrantVectorStore(qdrantClient, ownsClient: false);
             using var collection = vectorStore.GetCollection<Guid, ChatMessage>(collectionName);
             await collection.UpsertAsync(chatMessage, cancellationToken);
+        }
+
+        public async Task<ChatMessage[]> GetAsync(CancellationToken cancellationToken)
+        {
+            var chatMessages = new List<ChatMessage>();
+            PointId nextPageOffset = null;
+            uint pageSize = 500;
+            var fieldNames = typeof(ChatMessage)
+                .GetProperties(BindingFlags.Public | BindingFlags.Instance)
+                .Select(f =>
+                {
+                    var attr = f.GetCustomAttribute<VectorStoreDataAttribute>();
+                    return attr?.StorageName ?? f.Name;
+                })
+                .ToList();
+
+            var payloadSelector = new WithPayloadSelector { Include = new PayloadIncludeSelector() };
+            payloadSelector.Include.Fields.AddRange(fieldNames);
+
+            do
+            {
+                var response = await qdrantClient.ScrollAsync(collectionName: collectionName, 
+                    limit: pageSize, 
+                    offset: nextPageOffset,
+                    payloadSelector: payloadSelector,
+                    cancellationToken: cancellationToken);
+                var messages = response.Result.Select(d => MapFieldExtensions.MapToChatMessage(d.Payload)).ToArray();
+                chatMessages.AddRange(messages);
+
+                nextPageOffset = response.NextPageOffset;
+            } while (nextPageOffset != null);
+
+            return chatMessages.ToArray();
         }
 
         public async Task<ChatMessage[]> SearchAsync(string text, CancellationToken cancellationToken)
@@ -30,21 +66,21 @@
                 Filter = f => f.UserId == userId
             }, cancellationToken);
 
-            var hotels = new List<ChatMessage>();
+            var chatMessages = new List<ChatMessage>();
             await foreach (var searchResult in searchResults)
             {
                 if (searchResult.Score >= 0.7)
                 {
-                    hotels.Add(searchResult.Record);
+                    chatMessages.Add(searchResult.Record);
                 }
             }
 
-            return hotels.ToArray();
+            return chatMessages.ToArray();
         }
         
         public async Task DeleteAsync(CancellationToken cancellationToken)
         {
-            const int batchSize = 500;
+            int batchSize = 500;
             var toDelete = new List<Guid>(batchSize);
             bool hasMore = true;
 
@@ -53,10 +89,8 @@
 
             while (hasMore)
             {
-                var messages = collection.GetAsync(f => f.UserId == userId, top: batchSize, options: new FilteredRecordRetrievalOptions<ChatMessage>
-                {
-                    IncludeVectors = false,
-                }, cancellationToken: cancellationToken);
+                var retrievalOptions = new FilteredRecordRetrievalOptions<ChatMessage> { IncludeVectors = false };
+                var messages = collection.GetAsync(f => f.UserId == userId, top: batchSize, options: retrievalOptions, cancellationToken: cancellationToken);
 
                 toDelete.Clear();
                 await foreach (var message in messages)
